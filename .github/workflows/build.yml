@@ -1,0 +1,246 @@
+name: Build LG Remote APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p LGRemote/app/src/main/java/com/ali/lgremote
+          cat > LGRemote/settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "LGRemote"
+          include(":app")
+          EOF
+          cat > LGRemote/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          echo "android.useAndroidX=true" > LGRemote/gradle.properties
+          cat > LGRemote/app/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.ali.lgremote"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.ali.lgremote"; minSdk = 24; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+          }
+          EOF
+          cat > LGRemote/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.TRANSMIT_IR" />
+              <uses-feature android:name="android.hardware.consumerir" android:required="false" />
+              <application android:label="LG TV Remote" android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > LGRemote/app/src/main/java/com/ali/lgremote/MainActivity.kt <<'EOF'
+          package com.ali.lgremote
+
+          import android.content.Context
+          import android.hardware.ConsumerIrManager
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+          import okhttp3.*
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+
+          data class Key(val label: String, val ir: Long = 0, val btn: String? = null,
+                         val uri: String? = null, val payload: JSONObject? = null)
+
+          class Tv(ctx: Context) {
+              val prefs = ctx.getSharedPreferences("tv", 0)
+              private val http = OkHttpClient()
+              private var ws: WebSocket? = null
+              private var ptr: WebSocket? = null
+              private var n = 0
+              private var muted = false
+              var connected by mutableStateOf(false)
+              var status by mutableStateOf("Not connected")
+
+              private val perms = JSONArray(listOf("LAUNCH", "LAUNCH_WEBAPP", "APP_TO_APP", "CONTROL_AUDIO", "CONTROL_DISPLAY",
+                  "CONTROL_INPUT_JOYSTICK", "CONTROL_INPUT_MEDIA_PLAYBACK", "CONTROL_INPUT_MEDIA_RECORDING",
+                  "CONTROL_INPUT_TV", "CONTROL_INPUT_TEXT", "CONTROL_MOUSE_AND_KEYBOARD", "CONTROL_POWER",
+                  "READ_INSTALLED_APPS", "READ_RUNNING_APPS", "READ_TV_CHANNEL_LIST", "READ_CURRENT_CHANNEL",
+                  "READ_INPUT_DEVICE_LIST", "WRITE_NOTIFICATION_TOAST"))
+
+              private fun register(): String {
+                  val p = JSONObject().put("forcePairing", false).put("pairingType", "PROMPT")
+                      .put("manifest", JSONObject().put("manifestVersion", 1).put("permissions", perms))
+                  prefs.getString("key", null)?.let { p.put("client-key", it) }
+                  return JSONObject().put("type", "register").put("id", "reg").put("payload", p).toString()
+              }
+
+              fun connect(ip: String) {
+                  ws?.close(1000, null); ptr?.close(1000, null)
+                  status = "Connecting… accept the prompt on the TV"
+                  ws = http.newWebSocket(Request.Builder().url("ws://$ip:3000").build(), object : WebSocketListener() {
+                      override fun onOpen(w: WebSocket, r: Response) { w.send(register()) }
+                      override fun onMessage(w: WebSocket, t: String) {
+                          val j = JSONObject(t); val p = j.optJSONObject("payload")
+                          when (j.optString("type")) {
+                              "registered" -> {
+                                  prefs.edit().putString("key", p?.optString("client-key")).apply()
+                                  connected = true; status = "Connected (Wi-Fi)"
+                                  call("ssap://com.webos.service.networkinput/getPointerInputSocket")
+                              }
+                              "response" -> p?.optString("socketPath")?.takeIf { it.isNotEmpty() }?.let {
+                                  ptr = http.newWebSocket(Request.Builder().url(it).build(), object : WebSocketListener() {})
+                              }
+                              "error" -> status = "TV error: " + j.optString("error")
+                          }
+                      }
+                      override fun onFailure(w: WebSocket, t: Throwable, r: Response?) { connected = false; status = "Failed: ${t.message}" }
+                      override fun onClosed(w: WebSocket, c: Int, r: String) { connected = false; status = "Disconnected" }
+                  })
+              }
+
+              fun call(uri: String, payload: JSONObject? = null) {
+                  val m = JSONObject().put("type", "request").put("id", "r${n++}").put("uri", uri)
+                  payload?.let { m.put("payload", it) }
+                  ws?.send(m.toString())
+              }
+
+              fun send(k: Key): Boolean = when {
+                  k.uri == "mute" -> { muted = !muted; call("ssap://audio/setMute", JSONObject().put("mute", muted)); true }
+                  k.uri != null -> { call(k.uri, k.payload); true }
+                  k.btn != null -> ptr?.send("type:button\nname:${k.btn}\n\n") ?: false
+                  else -> false
+              }
+
+              fun wake(mac: String) = Thread {
+                  try {
+                      val m = mac.split(":", "-").map { it.toInt(16).toByte() }.toByteArray()
+                      val d = ByteArray(6) { 0xFF.toByte() } + ByteArray(96) { m[it % 6] }
+                      DatagramSocket().use { it.broadcast = true; it.send(DatagramPacket(d, d.size, InetAddress.getByName("255.255.255.255"), 9)) }
+                      status = "Wake-on-LAN sent"
+                  } catch (e: Exception) { status = "WoL failed: ${e.message}" }
+              }.start()
+          }
+
+          fun nec(code: Long): IntArray {
+              val l = ArrayList<Int>(); l += 9000; l += 4500
+              for (i in 31 downTo 0) { l += 560; l += if ((code shr i) and 1L == 1L) 1690 else 560 }
+              l += 560; l += 40000
+              return l.toIntArray()
+          }
+
+          fun app(label: String, id: String) = Key(label, uri = "ssap://system.launcher/launch", payload = JSONObject().put("id", id))
+          fun ssap(label: String, ir: Long, uri: String) = Key(label, ir, uri = uri)
+
+          class MainActivity : ComponentActivity() {
+              private lateinit var tv: Tv
+              private var ir: ConsumerIrManager? = null
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  tv = Tv(this)
+                  ir = getSystemService(Context.CONSUMER_IR_SERVICE) as? ConsumerIrManager
+                  setContent { MaterialTheme { Remote() } }
+              }
+
+              private fun press(k: Key, wifi: Boolean) {
+                  if (wifi && tv.connected && tv.send(k)) return
+                  val e = ir
+                  if (k.ir == 0L) tv.status = "${k.label} needs a Wi-Fi connection"
+                  else if (e != null && e.hasIrEmitter()) e.transmit(38000, nec(k.ir))
+                  else tv.status = "No IR blaster on this phone, and Wi-Fi not connected"
+              }
+
+              @Composable
+              fun Remote() {
+                  var ip by remember { mutableStateOf(tv.prefs.getString("ip", "") ?: "") }
+                  var mac by remember { mutableStateOf(tv.prefs.getString("mac", "") ?: "") }
+                  var wifi by remember { mutableStateOf(true) }
+                  var text by remember { mutableStateOf("") }
+
+                  @Composable fun R(vararg ks: Key?) = Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                      ks.forEach { k ->
+                          if (k == null) Spacer(Modifier.weight(1f))
+                          else Button({ press(k, wifi) }, Modifier.weight(1f), contentPadding = PaddingValues(2.dp)) { Text(k.label) }
+                      }
+                  }
+
+                  Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp).systemBarsPadding(),
+                      verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                      OutlinedTextField(ip, { ip = it }, Modifier.fillMaxWidth(), label = { Text("TV IP (Settings > Network)") }, singleLine = true)
+                      OutlinedTextField(mac, { mac = it }, Modifier.fillMaxWidth(), label = { Text("TV MAC (for Wi-Fi power on)") }, singleLine = true)
+                      Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                          Button({ tv.prefs.edit().putString("ip", ip).putString("mac", mac).apply(); tv.connect(ip.trim()) }) { Text("Connect") }
+                          Button({ tv.wake(mac.trim()) }) { Text("Wi-Fi Power On") }
+                          FilterChip(wifi, { wifi = !wifi }, label = { Text(if (wifi) "Mode: Wi-Fi" else "Mode: IR") })
+                      }
+                      Text(tv.status)
+
+                      R(Key("Power", 0x20DF10EF, uri = "ssap://system/turnOff"), Key("Input", 0x20DFD02F), Key("Mute", 0x20DF906F, uri = "mute"), Key("Info", 0x20DF55AA, "INFO"))
+                      R(Key("Home", 0x20DF3EC1, "HOME"), Key("Menu", 0x20DFC23D, "MENU"), Key("Back", 0x20DF14EB, "BACK"), Key("Exit", 0x20DFDA25, "EXIT"))
+                      R(null, Key("▲", 0x20DF02FD, "UP"), null)
+                      R(Key("◀", 0x20DFE01F, "LEFT"), Key("OK", 0x20DF22DD, "ENTER"), Key("▶", 0x20DF609F, "RIGHT"))
+                      R(null, Key("▼", 0x20DF827D, "DOWN"), null)
+                      R(ssap("Vol +", 0x20DF40BF, "ssap://audio/volumeUp"), ssap("Ch +", 0x20DF00FF, "ssap://tv/channelUp"))
+                      R(ssap("Vol −", 0x20DFC03F, "ssap://audio/volumeDown"), ssap("Ch −", 0x20DF807F, "ssap://tv/channelDown"))
+                      val d = listOf(0x20DF08F7, 0x20DF8877, 0x20DF48B7, 0x20DFC837, 0x20DF28D7, 0x20DFA857, 0x20DF6897, 0x20DFE817, 0x20DF18E7, 0x20DF9867)
+                      R(Key("1", d[1].toLong(), "1"), Key("2", d[2].toLong(), "2"), Key("3", d[3].toLong(), "3"))
+                      R(Key("4", d[4].toLong(), "4"), Key("5", d[5].toLong(), "5"), Key("6", d[6].toLong(), "6"))
+                      R(Key("7", d[7].toLong(), "7"), Key("8", d[8].toLong(), "8"), Key("9", d[9].toLong(), "9"))
+                      R(null, Key("0", d[0].toLong(), "0"), null)
+                      R(Key("⏪", 0x20DFF10E, "REWIND"), Key("▶︎", 0x20DF0DF2, "PLAY"), Key("⏸", 0x20DF5DA2, "PAUSE"), Key("⏩", 0x20DF718E, "FASTFORWARD"), Key("⏹", 0x20DF8D72, "STOP"))
+                      R(Key("Red", 0x20DF4EB1, "RED"), Key("Green", 0x20DF8E71, "GREEN"), Key("Yellow", 0x20DFC639, "YELLOW"), Key("Blue", 0x20DF8679, "BLUE"))
+                      R(app("YouTube", "youtube.leanback.v4"), app("Netflix", "netflix"), app("Prime", "amazon"))
+                      OutlinedTextField(text, { text = it }, Modifier.fillMaxWidth(), label = { Text("Type into TV (Wi-Fi only)") }, singleLine = true)
+                      R(Key("Send text", uri = "ssap://com.webos.service.ime/insertText", payload = JSONObject().put("text", text).put("replace", 0)),
+                        Key("Enter", uri = "ssap://com.webos.service.ime/sendEnterKey"),
+                        Key("Delete", uri = "ssap://com.webos.service.ime/deleteCharacters", payload = JSONObject().put("count", 1)))
+                  }
+              }
+          }
+          EOF
+      - name: Build
+        working-directory: LGRemote
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LGRemote-apk
+          path: LGRemote/app/build/outputs/apk/debug/app-debug.apk
